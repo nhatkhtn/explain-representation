@@ -32,7 +32,7 @@ class KDLoss(torch.nn.Module):
                  gamma1: float,
                  gamma2: float,
                  temperature: float = 1.0,
-                 kernel: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = euclidean_to_cosine_similarity_kernel
+                 weights: torch.Tensor | None = None,
                  ):
         """Knowledge distillation loss
 
@@ -41,26 +41,26 @@ class KDLoss(torch.nn.Module):
             gamma1 (float): moving average coefficient for u update
             gamma2 (float): moving average coefficient for v update
             temperature (float): temperature for softmax
+            weights (torch.Tensor, optional): weights for each sample. Defaults to None.
         """
-        super().__init__()
+        super(KDLoss, self).__init__()
         self.data_size = data_size
         self.gamma1 = gamma1
         self.gamma2 = gamma2
         self.temperature = temperature
+        self.weights = weights
 
         self.u = torch.zeros(data_size, device="cpu").reshape(-1, 1)
         self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)
-        self.kernel = kernel
 
     def forward(self, features_student, features_teacher, index):
         # normalize the features
-        # features_student = torch.nn.functional.normalize(features_student, dim=-1)
-        # features_teacher = torch.nn.functional.normalize(features_teacher, dim=-1)
+        features_student = torch.nn.functional.normalize(features_student, dim=-1)
+        features_teacher = torch.nn.functional.normalize(features_teacher, dim=-1)
 
         # update u
         # logits are exp(cosine_similarity / temperature)
-        # sim_teacher = features_teacher @ features_teacher.t()
-        sim_teacher = self.kernel(features_teacher, features_teacher)
+        sim_teacher = features_teacher @ features_teacher.t()
         logits_teacher = torch.exp(sim_teacher / self.temperature)                      # shape: (B, B)
         with torch.no_grad():
             u = self.u[index].to(features_teacher.device)                               # shape: (B, 1)
@@ -72,8 +72,7 @@ class KDLoss(torch.nn.Module):
             self.u[index] = u.cpu()
 
         # update v
-        # sim_student = features_student @ features_student.t()
-        sim_student = self.kernel(features_student, features_student)
+        sim_student = features_student @ features_student.t()
         logits_student = torch.exp(sim_student / self.temperature)                      # shape: (B, B)
         with torch.no_grad():
             v = self.v[index].to(features_student.device)                               # shape: (B, 1)
@@ -86,9 +85,14 @@ class KDLoss(torch.nn.Module):
         g_student_batch = torch.mean(logits_student, dim=-1, keepdim=True) / logits_student # shape: (B, B)
 
         # compute gradient estimator
-        grad_estimator = torch.mean(logits_teacher.detach() / u * logits_student.detach() / v * g_student_batch)
+        if self.weights is not None:
+            weights = self.weights[index].to(features_student.device)
+        else:
+            weights = torch.ones_like(index, dtype=torch.float32, device=features_student.device)
+        grad_estimator = torch.mean(logits_teacher.detach() / u * logits_student.detach() / v * g_student_batch * weights)
         with torch.no_grad():
-            loss_batch = torch.mean(logits_teacher / torch.mean(logits_teacher, dim=-1, keepdim=True) * torch.log(torch.mean(logits_student, dim=-1, keepdim=True) / logits_student))
+            loss_batch = torch.sum(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
+                                   torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1))
         return {"grad_estimator": grad_estimator, "loss": loss_batch}
 
 
@@ -188,7 +192,9 @@ def main(args):
     model_teacher = torch.nn.Linear(10, 10).to(args.device)
 
     # create loss
-    loss = KDLoss(data_size=args.data_size, gamma1=args.gamma, gamma2=args.gamma).to(args.device)
+    # weights = torch.randn(args.data_size)
+    weights = None                              # default, equal weights
+    loss = KDLoss(data_size=args.data_size, gamma1=args.gamma, gamma2=args.gamma, weights=weights).to(args.device)
 
     # create optimizer
     optimizer = torch.optim.AdamW(model_student.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -202,7 +208,6 @@ def main(args):
     # distill
     for epoch in range(args.epochs):
         ditill_one_epoch(model_student, model_teacher, dataloader, loss, optimizer, epoch, args)
-
 
 if __name__ == "__main__":
     main(sys.argv[1:])
