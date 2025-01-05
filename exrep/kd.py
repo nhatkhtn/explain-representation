@@ -31,7 +31,8 @@ class KDLoss(torch.nn.Module):
                  data_size: int,
                  gamma1: float,
                  gamma2: float,
-                 temperature: float = 1.0,
+                 temp_student: float = 1.0,
+                 temp_teacher: float = 1.0,
                  weights: torch.Tensor | None = None,
                  ):
         """Knowledge distillation loss
@@ -40,28 +41,38 @@ class KDLoss(torch.nn.Module):
             data_size (int): size of the dataset, used to determine the length of u vector
             gamma1 (float): moving average coefficient for u update
             gamma2 (float): moving average coefficient for v update
-            temperature (float): temperature for softmax
+            temp_s (float, optional): temperature for student. Defaults to 1.0.
+            temp_t (float, optional): temperature for teacher. Defaults to 1.0.
             weights (torch.Tensor, optional): weights for each sample. Defaults to None.
         """
         super(KDLoss, self).__init__()
         self.data_size = data_size
         self.gamma1 = gamma1
         self.gamma2 = gamma2
-        self.temperature = temperature
+        self.temp_student = temp_student
+        self.temp_teacher = temp_teacher
         self.weights = weights
 
         self.u = torch.zeros(data_size, device="cpu").reshape(-1, 1)
         self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)
 
-    def forward(self, features_student, features_teacher, index):
-        # normalize the features
-        features_student = torch.nn.functional.normalize(features_student, dim=-1)
-        features_teacher = torch.nn.functional.normalize(features_teacher, dim=-1)
-
+    def forward(self, 
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        features_teacher: torch.Tensor,
+        index
+    ):
+        assert queries.shape == keys.shape, "Queries and keys must have the same shape"
+        assert queries.shape[0] == features_teacher.shape[0], "Queries and features_teacher must have the same number of samples"
+        
+        # normalize queries and keys
+        queries = torch.nn.functional.normalize(queries, p=2, dim=-1)
+        keys = torch.nn.functional.normalize(keys, p=2, dim=-1)
+        
         # update u
         # logits are exp(cosine_similarity / temperature)
         sim_teacher = features_teacher @ features_teacher.t()
-        logits_teacher = torch.exp(sim_teacher / self.temperature)                      # shape: (B, B)
+        logits_teacher = torch.exp(sim_teacher / self.temp_teacher)                      # shape: (B, B)
         with torch.no_grad():
             u = self.u[index].to(features_teacher.device)                               # shape: (B, 1)
             if u.sum() == 0:
@@ -72,10 +83,10 @@ class KDLoss(torch.nn.Module):
             self.u[index] = u.cpu()
 
         # update v
-        sim_student = features_student @ features_student.t()
-        logits_student = torch.exp(sim_student / self.temperature)                      # shape: (B, B)
+        sim_student = queries @ keys.t()
+        logits_student = torch.exp(sim_student / self.temp_student)                      # shape: (B, B)
         with torch.no_grad():
-            v = self.v[index].to(features_student.device)                               # shape: (B, 1)
+            v = self.v[index].to(queries.device)                               # shape: (B, 1)
             if v.sum() == 0:
                 gamma2 = 1.0
             else:
@@ -86,12 +97,12 @@ class KDLoss(torch.nn.Module):
 
         # compute gradient estimator
         if self.weights is not None:
-            weights = self.weights[index].to(features_student.device)
+            weights = self.weights[index].to(queries.device)
         else:
-            weights = torch.ones_like(index, dtype=torch.float32, device=features_student.device)
+            weights = torch.ones_like(index, dtype=torch.float32, device=queries.device)
         grad_estimator = torch.mean(logits_teacher.detach() / u * logits_student.detach() / v * g_student_batch * weights)
         with torch.no_grad():
-            loss_batch = torch.sum(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
+            loss_batch = torch.mean(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
                                    torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1))
         return {"grad_estimator": grad_estimator, "loss": loss_batch}
 
@@ -129,12 +140,23 @@ def ditill_one_epoch(model_student, model_teacher, dataloader, loss, optimizer, 
             logging.info((f"Epoch {epoch:>2d}, Step {i:>4d}, Loss: {losses['loss'].item():.5f}"))
 
 
-def distill_one_epoch(model_student, teacher_embeddings, dataloader, loss, optimizer, epoch, device, log_every_n_steps):
+def distill_one_epoch(
+    query_encoder: torch.nn.Module,
+    key_encoder: torch.nn.Module,
+    teacher_embeddings: torch.Tensor,
+    dataloader: torch.utils.data.DataLoader,
+    loss: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    device: str,
+    log_every_n_steps: int,
+) -> list[dict[str, int | float]]:
     """Distill one epoch
 
     Args:
-        model_student (torch.nn.Module): student model
-        teacher_embeddings (torch.nn.Tensor): teacher embeddings
+        query_encoder (torch.nn.Module): student model
+        key_encoder (torch.nn.Module): projector from teacher space to student space
+        teacher_embeddings (torch.Tensor): teacher embeddings
         dataloader (torch.utils.data.DataLoader): data loader
         loss (torch.nn.Module): loss function
         optimizer (torch.optim.Optimizer): optimizer
@@ -142,7 +164,8 @@ def distill_one_epoch(model_student, teacher_embeddings, dataloader, loss, optim
         device (str): device
         log_every_n_steps (int): log every n steps
     """
-    model_student.train()
+    query_encoder.train()
+    key_encoder.train()
 
     device = torch.device(device)
 
@@ -155,10 +178,10 @@ def distill_one_epoch(model_student, teacher_embeddings, dataloader, loss, optim
         images, indices = itemgetter("images", "indices")(batch)
         images = images.to(device)
 
-        features_student = model_student(images)
-        features_teacher = teacher_embeddings[indices]
+        queries = query_encoder(images)
+        keys = key_encoder(teacher_embeddings[indices])
 
-        losses = loss(features_student, features_teacher, indices)
+        losses = loss(queries, keys, teacher_embeddings[indices], indices)
         
         optimizer.zero_grad()
         losses["grad_estimator"].backward()
@@ -166,7 +189,7 @@ def distill_one_epoch(model_student, teacher_embeddings, dataloader, loss, optim
 
         if i % log_every_n_steps == 0:
             logging.info((f"Epoch {epoch:>2d}, Step {i:>4d}, Loss: {losses['loss'].item():.5f}"))
-            logs.append({"epoch": epoch, "step": i, "loss": losses["loss"].item()})
+        logs.append({"epoch": epoch, "step": i, "loss": losses["loss"].item()})
 
     return logs
 
