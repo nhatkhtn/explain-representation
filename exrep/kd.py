@@ -26,6 +26,58 @@ def euclidean_to_cosine_similarity_kernel(X: torch.Tensor, Y: torch.Tensor) -> t
     """
     return 1 - torch.cdist(X, Y, p=2) ** 2 / 2
 
+class KDLossNaive(torch.nn.Module):
+    def __init__(self,
+                 data_size: int,
+                 gamma1: float,
+                 gamma2: float,
+                 temp_student: float = 1.0,
+                 temp_teacher: float = 1.0,
+                 weights: torch.Tensor | None = None,
+                 ):
+        """Knowledge distillation loss
+
+        Args:
+            data_size (int): size of the dataset, used to determine the length of u vector
+            gamma1 (float): moving average coefficient for u update
+            gamma2 (float): moving average coefficient for v update
+            temp_s (float, optional): temperature for student. Defaults to 1.0.
+            temp_t (float, optional): temperature for teacher. Defaults to 1.0.
+            weights (torch.Tensor, optional): weights for each sample. Defaults to None.
+        """
+        super().__init__()
+        self.data_size = data_size
+        self.gamma1 = gamma1
+        self.gamma2 = gamma2
+        self.temp_student = temp_student
+        self.temp_teacher = temp_teacher
+        self.weights = weights
+
+        self.u = torch.zeros(data_size, device="cpu").reshape(-1, 1)
+        self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)
+
+    def forward(self,
+        queries_student: torch.Tensor,
+        keys_student: torch.Tensor,
+        queries_teacher: torch.Tensor,
+        keys_teacher: torch.Tensor,
+        index
+    ):
+        # normalize the student's queries and keys
+        queries_student = torch.nn.functional.normalize(queries_student, p=2, dim=-1)
+        keys_student = torch.nn.functional.normalize(keys_student, p=2, dim=-1)
+        
+        # logits are exp(cosine_similarity / temperature)
+        sim_teacher = queries_teacher @ keys_teacher.t()                                # shape: (Q, K)
+        log_probs_teacher = torch.nn.functional.log_softmax(sim_teacher / self.temp_teacher, dim=-1)            
+      
+        sim_student = queries_student @ keys_student.t()                                # shape: (Q, K)
+        log_probs_student = torch.nn.functional.log_softmax(sim_student / self.temp_student, dim=-1)
+
+        # the teacher is fixed meaning the entropy H(teacher) is fixed, so we can miminize the KL divergence
+        kl_loss = torch.nn.functional.kl_div(log_probs_student, log_probs_teacher, reduction="batchmean", log_target=True)
+        return kl_loss
+
 class KDLoss(torch.nn.Module):
     def __init__(self,
                  data_size: int,
@@ -143,9 +195,10 @@ def ditill_one_epoch(model_student, model_teacher, dataloader, loss, optimizer, 
 def distill_one_epoch(
     query_encoder: torch.nn.Module,
     key_encoder: torch.nn.Module,
-    teacher_embeddings: torch.Tensor,
+    query_embeddings: torch.Tensor,
+    keys_embeddings: torch.Tensor,
     dataloader: torch.utils.data.DataLoader,
-    loss: torch.nn.Module,
+    loss_fn: KDLossNaive,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     device: str,
@@ -155,9 +208,10 @@ def distill_one_epoch(
 
     Args:
         query_encoder (torch.nn.Module): student model
-        key_encoder (torch.nn.Module): projector from teacher space to student space
-        teacher_embeddings (torch.Tensor): teacher embeddings
-        dataloader (torch.utils.data.DataLoader): data loader
+        key_encoder (torch.nn.Module): trainable projector from teacher space to student space
+        query_embeddings (torch.Tensor): teacher-embedded queries
+        keys_embeddings (torch.Tensor): teacher-embedded keys
+        dataloader (torch.utils.data.DataLoader): dataloader for queries (images in local features form)
         loss (torch.nn.Module): loss function
         optimizer (torch.optim.Optimizer): optimizer
         epoch (int): epoch
@@ -169,8 +223,10 @@ def distill_one_epoch(
 
     device = torch.device(device)
 
-    if not isinstance(teacher_embeddings, torch.Tensor):
-        teacher_embeddings = torch.tensor(teacher_embeddings, device=device)
+    if not isinstance(query_embeddings, torch.Tensor):
+        query_embeddings = torch.tensor(query_embeddings, device=device)
+    if not isinstance(keys_embeddings, torch.Tensor):
+        keys_embeddings = torch.tensor(keys_embeddings, device=device)
 
     logs = []
 
@@ -178,18 +234,21 @@ def distill_one_epoch(
         images, indices = itemgetter("images", "indices")(batch)
         images = images.to(device)
 
-        queries = query_encoder(images)
-        keys = key_encoder(teacher_embeddings[indices])
+        queries_student = query_encoder(images)
+        keys_student = key_encoder(keys_embeddings)
 
-        losses = loss(queries, keys, teacher_embeddings[indices], indices)
-        
+        losses = loss_fn(queries_student, keys_student, query_embeddings[indices], keys_embeddings, indices)
+        # losses = loss(queries, keys, teacher_embeddings[indices], indices)
+        loss = losses
+
         optimizer.zero_grad()
-        losses["grad_estimator"].backward()
+        # losses["grad_estimator"].backward()
+        loss.backward()
         optimizer.step()
 
         if i % log_every_n_steps == 0:
-            logging.info((f"Epoch {epoch:>2d}, Step {i:>4d}, Loss: {losses['loss'].item():.5f}"))
-        logs.append({"epoch": epoch, "step": i, "loss": losses["loss"].item()})
+            logging.info(f"Epoch {epoch:>2d}, Step {i:>4d}, Loss: {loss.item():.5f}")
+        logs.append({"epoch": epoch, "step": i, "loss": loss.item()})
 
     return logs
 

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from transformers.tokenization_utils_base import BatchEncoding
 
-from exrep.kd import KDLoss, distill_one_epoch
+from exrep.kd import KDLossNaive, distill_one_epoch
 
 TensorDict = dict[str, torch.Tensor] | BatchEncoding
 
@@ -74,9 +74,13 @@ class KDRegressor:
         self.logs = []
         self.query_encoder = None
         self.key_encoder = None
+        self.keys = None
+
+    def set_keys(self, keys: np.ndarray):
+        self.keys = torch.tensor(keys, device=self.device, dtype=torch.float32)
 
     def fit(self, data: np.ndarray, embeddings: np.ndarray, sample_weight: np.ndarray):
-        """Fit the regressor to the data.
+        """Fit the regressor to the (query) data.
 
         Args:
             data (np.ndarray): NumPy array of shape (n_samples, n_patches) containing the data with local features.
@@ -88,7 +92,8 @@ class KDRegressor:
         n_repr_dim = embeddings.shape[1]
         n_output_dim = self.n_output_dim
         assert embeddings.shape[0] == n_samples, "Number of samples in data and embeddings must match."
-        
+        assert self.keys is not None, "Keys must be set before fitting the model."
+
         # create models
         # student model (e')
         self.query_encoder = torch.nn.Linear(n_local_features, n_output_dim).to(self.device)
@@ -104,7 +109,7 @@ class KDRegressor:
         # use fixed sample weight for now
         sample_weight = torch.ones_like(sample_weight)
         logger.warning("Using fixed sample weight for now.")
-        loss = KDLoss(
+        loss = KDLossNaive(
             data_size=n_samples, gamma1=0.9, gamma2=0.9,
             weights=sample_weight,
             temp_student=self.temp_student, temp_teacher=self.temp_teacher,
@@ -118,7 +123,8 @@ class KDRegressor:
         # distill
         for epoch in range(self.num_epochs):
             logs = distill_one_epoch(
-                self.query_encoder, self.key_encoder, embeddings, 
+                self.query_encoder, self.key_encoder, 
+                embeddings, self.keys,
                 dataloader, loss, optimizer, epoch, self.device, 
                 log_every_n_steps=5,
             )
