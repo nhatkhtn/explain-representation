@@ -2,7 +2,6 @@ import argparse
 import logging
 import sys
 from operator import itemgetter
-from typing import Callable
 
 import torch
 import torch.utils.data
@@ -13,18 +12,6 @@ logging.basicConfig(
     style="{",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
-def euclidean_to_cosine_similarity_kernel(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    """Kernel recovering the cosine similarity from the euclidean distance
-
-    Args:
-        X (torch.Tensor): tensor of shape (N, D)
-        Y (torch.Tensor): tensor of shape (M, D)
-
-    Returns:
-        torch.Tensor: tensor of shape (N, M)
-    """
-    return 1 - torch.cdist(X, Y, p=2) ** 2 / 2
 
 class KDLossNaive(torch.nn.Module):
     def __init__(self,
@@ -78,86 +65,6 @@ class KDLossNaive(torch.nn.Module):
         kl_loss = torch.nn.functional.kl_div(log_probs_student, log_probs_teacher, reduction="batchmean", log_target=True)
         return kl_loss
 
-class KDLoss(torch.nn.Module):
-    def __init__(self,
-                 data_size: int,
-                 gamma1: float,
-                 gamma2: float,
-                 temp_student: float = 1.0,
-                 temp_teacher: float = 1.0,
-                 weights: torch.Tensor | None = None,
-                 ):
-        """Knowledge distillation loss
-
-        Args:
-            data_size (int): size of the dataset, used to determine the length of u vector
-            gamma1 (float): moving average coefficient for u update
-            gamma2 (float): moving average coefficient for v update
-            temp_s (float, optional): temperature for student. Defaults to 1.0.
-            temp_t (float, optional): temperature for teacher. Defaults to 1.0.
-            weights (torch.Tensor, optional): weights for each sample. Defaults to None.
-        """
-        super(KDLoss, self).__init__()
-        self.data_size = data_size
-        self.gamma1 = gamma1
-        self.gamma2 = gamma2
-        self.temp_student = temp_student
-        self.temp_teacher = temp_teacher
-        self.weights = weights
-
-        self.u = torch.zeros(data_size, device="cpu").reshape(-1, 1)
-        self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)
-
-    def forward(self, 
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        features_teacher: torch.Tensor,
-        index
-    ):
-        assert queries.shape == keys.shape, "Queries and keys must have the same shape"
-        assert queries.shape[0] == features_teacher.shape[0], "Queries and features_teacher must have the same number of samples"
-        
-        # normalize queries and keys
-        queries = torch.nn.functional.normalize(queries, p=2, dim=-1)
-        keys = torch.nn.functional.normalize(keys, p=2, dim=-1)
-        
-        # update u
-        # logits are exp(cosine_similarity / temperature)
-        sim_teacher = features_teacher @ features_teacher.t()
-        logits_teacher = torch.exp(sim_teacher / self.temp_teacher)                      # shape: (B, B)
-        with torch.no_grad():
-            u = self.u[index].to(features_teacher.device)                               # shape: (B, 1)
-            if u.sum() == 0:
-                gamma1 = 1.0
-            else:
-                gamma1 = self.gamma1
-            u = (1 - gamma1) * u + gamma1 * torch.mean(logits_teacher, dim=-1, keepdim=True)
-            self.u[index] = u.cpu()
-
-        # update v
-        sim_student = queries @ keys.t()
-        logits_student = torch.exp(sim_student / self.temp_student)                      # shape: (B, B)
-        with torch.no_grad():
-            v = self.v[index].to(queries.device)                               # shape: (B, 1)
-            if v.sum() == 0:
-                gamma2 = 1.0
-            else:
-                gamma2 = self.gamma2
-            v = (1 - gamma2) * v + gamma2 * torch.mean(logits_student, dim=-1, keepdim=True)
-            self.v[index] = v.cpu()
-        g_student_batch = torch.mean(logits_student, dim=-1, keepdim=True) / logits_student # shape: (B, B)
-
-        # compute gradient estimator
-        if self.weights is not None:
-            weights = self.weights[index].to(queries.device)
-        else:
-            weights = torch.ones_like(index, dtype=torch.float32, device=queries.device)
-        grad_estimator = torch.mean(logits_teacher.detach() / u * logits_student.detach() / v * g_student_batch * weights)
-        with torch.no_grad():
-            loss_batch = torch.mean(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
-                                   torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1))
-        return {"grad_estimator": grad_estimator, "loss": loss_batch}
-
 
 def ditill_one_epoch(model_student, model_teacher, dataloader, loss, optimizer, epoch, args):
     """Distill one epoch
@@ -199,6 +106,7 @@ def distill_one_epoch(
     keys_embeddings: torch.Tensor,
     dataloader: torch.utils.data.DataLoader,
     loss_fn: KDLossNaive,
+    regularizer_fn: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     device: str,
@@ -238,12 +146,11 @@ def distill_one_epoch(
         keys_student = key_encoder(keys_embeddings)
 
         losses = loss_fn(queries_student, keys_student, query_embeddings[indices], keys_embeddings, indices)
-        # losses = loss(queries, keys, teacher_embeddings[indices], indices)
-        loss = losses
+        # only the query encoder is regularized
+        loss = losses["loss"] + regularizer_fn(query_encoder)
 
         optimizer.zero_grad()
-        # losses["grad_estimator"].backward()
-        loss.backward()
+        losses["grad_estimator"].backward()
         optimizer.step()
 
         if i % log_every_n_steps == 0:

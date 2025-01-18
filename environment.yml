@@ -25,6 +25,10 @@ dependencies:
   # for LIME
   - scikit-image
   - pydoe2
+
+  # development tools
+  - ipywidgets
+  - pytest
   # - evaluate
   # - diffusers
   # - accelerate
