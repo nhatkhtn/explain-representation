@@ -24,7 +24,7 @@ def train_local_representation(
     log_every_n_steps: int = 10,
     device: str = "cuda",
 ):
-    """Train local representation approximator
+    """Train local representation with student-teacher similarity matching.
 
     Args:
         model_config (dict): model configuration.
@@ -45,7 +45,7 @@ def train_local_representation(
     loss_config["data_size"] = query_inputs.shape[0]
 
     # create the model, optimizer, and loss
-    model = LocalRepresentationApproximator(**model_config)
+    model = LocalRepresentationApproximator(device=device, **model_config)
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
     loss_fn = KDLoss(**loss_config)
 
@@ -84,7 +84,7 @@ def train_local_representation(
             optimizer.step()
 
             if i % log_every_n_steps == 0:
-                logger.info(f"Epoch {epoch:>2d}, Step {i:>4d}, Loss: {total_loss.item():.5f}")
+                logger.info("Epoch %2d, Step %4d, Loss: %.5f", epoch, i, total_loss.item())
             logs.append({"epoch": epoch, "step": i, "loss_reg": loss_regularize.item()} | pythonize(loss_dict))
 
     return model, logs
