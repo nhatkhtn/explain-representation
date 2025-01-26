@@ -4,7 +4,6 @@ import torch
 
 def test_approximator_class():
     from exrep.model import LocalRepresentationApproximator
-    
     device = "cuda"
     approximator = LocalRepresentationApproximator(4, 5, 6, 1.0)
     query = torch.randn(10, 4, device=device)
@@ -43,8 +42,10 @@ def test_training():
         model_config=model_config,
         loss_config=loss_config,
         optimizer_config=optimizer_config,
-        query_inputs=query_inputs,
-        query_targets=query_targets,
+        query_inputs_train=query_inputs,
+        query_targets_train=query_targets,
+        query_inputs_val= query_inputs,
+        query_targets_val= query_targets,
         keys=keys,
         groups=[(0, 1), 2],
         alpha=1.0,
