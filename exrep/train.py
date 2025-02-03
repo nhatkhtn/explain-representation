@@ -71,7 +71,7 @@ def train_local_representation(
     # create dataloaders
     indices = torch.arange(n_queries)
     query_dataset = torch.utils.data.StackDataset(inputs=torch.Tensor(query_inputs_train), indices=indices)
-    query_dataloader = torch.utils.data.DataLoader(query_dataset, batch_size=batch_size, shuffle=True)
+    query_dataloader = torch.utils.data.DataLoader(query_dataset, batch_size=batch_size, shuffle=False)  # TODO: add shuffle back
 
     def compute_validation_loss():
         model.eval()

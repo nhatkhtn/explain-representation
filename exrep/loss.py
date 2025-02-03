@@ -75,7 +75,14 @@ class KDLoss(torch.nn.Module):
             weights = torch.ones_like(index, dtype=torch.float32, device=queries_student.device)
     
         grad_estimator = torch.mean(logits_teacher.detach() / u * logits_student.detach() / v * g_student_batch * weights[:, None])
-        with torch.no_grad():
-            loss_batch = torch.mean(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
-                                   torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1))
-        return {"grad_estimator": grad_estimator, "loss": loss_batch}
+        # with torch.no_grad():
+            # loss_per_element = torch.sum(torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_teacher, dim=-1) -\
+            #                              torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1), dim=-1)
+            # loss_batch_mean = torch.mean(loss_per_element)
+        loss_batch = torch.nn.functional.kl_div(
+            input=torch.log_softmax(sim_student / self.temp_student, dim=-1), 
+            target=torch.softmax(sim_teacher / self.temp_teacher, dim=-1), 
+            reduction="batchmean",
+        )
+        return {"grad_estimator": loss_batch, "loss": loss_batch}       # TODO: check this
+        # return {"grad_estimator": grad_estimator, "loss": loss_batch}
