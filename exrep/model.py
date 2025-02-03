@@ -25,13 +25,19 @@ class LocalRepresentationApproximator(torch.nn.Module):
         logits = torch.nn.functional.softmax(query_repr @ key_repr.T / self.temperature, dim=1)
         return logits
     
-    def encode(self, *, query: Optional[torch.Tensor] = None, key: Optional[torch.Tensor] = None):
+    def encode(self, *, query: Optional[torch.Tensor] = None, key: Optional[torch.Tensor] = None, normalize=False):
+        encoded_query = self.query_encoder(query) if query is not None else None
+        encoded_key = self.key_encoder(key) if key is not None else None
+        if normalize:
+            encoded_query = torch.nn.functional.normalize(encoded_query, dim=-1) if query is not None else None
+            encoded_key = torch.nn.functional.normalize(encoded_key, dim=-1) if key is not None else None
+
         if query is not None and key is not None:
-            return (self.query_encoder(query), self.key_encoder(key))
+            return encoded_query, encoded_key
         elif query is not None:
-            return self.query_encoder(query)
+            return encoded_query
         elif key is not None:
-            return self.key_encoder(key)
+            return encoded_key
         else:
             raise ValueError("At least one of query or key must be provided.")
         
