@@ -6,6 +6,7 @@ pretrained/
 data/
 wandb/
 .vscode/
+artifacts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

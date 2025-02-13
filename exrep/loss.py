@@ -15,7 +15,6 @@ class KDLoss(torch.nn.Module):
             data_size (int): size of the dataset, used to determine the length of u vector
             gamma1 (float): moving average coefficient for u update
             gamma2 (float): moving average coefficient for v update
-            alpha (float): parameter for regularization
             temp_student (float, optional): temperature for student. Defaults to 1.0.
             temp_teacher (float, optional): temperature for teacher. Defaults to 1.0.
             weights (torch.Tensor, optional): weights for each sample. Defaults to None.

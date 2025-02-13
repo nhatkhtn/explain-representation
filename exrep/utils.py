@@ -1,12 +1,15 @@
 import logging
 import collections
-from typing import Any, Callable, Iterable, Sequence
+from operator import itemgetter
+from typing import Any, Callable, Iterable, Literal, Sequence
 
+from tqdm import tqdm
 from PIL import Image
 import numpy as np
 import torch
-from transformers.tokenization_utils_base import BatchEncoding
 from transformers import pipeline
+from transformers.tokenization_utils_base import BatchEncoding
+from transformers.image_processing_base import BatchFeature
 
 TensorDict = dict[str, torch.Tensor] | BatchEncoding
 
@@ -41,6 +44,42 @@ def pythonize(d: dict[Any, torch.Tensor]) -> dict[str, Any]:
     
     Mostly used for logging purposes."""
     return {key: value.item() for key, value in d.items()}
+
+def default_comb_fn(accu, new):
+    if accu is None:
+        return new
+    else:
+        assert type(accu) == type(new), "Got {} and {}".format(type(accu), type(new))
+        if isinstance(accu, torch.Tensor):
+            return torch.cat([accu, new], dim=0)
+        elif isinstance(accu, (BatchFeature)):
+            for k in accu.keys():
+                accu[k] = torch.cat([accu[k], new[k]], dim=0)
+            return accu
+        else:
+            raise TypeError(f"Unsupported type {type(accu)}")
+
+def generic_map(
+    func, dataset, comb_fn=default_comb_fn, post_proc_fn=lambda x: x,
+    input_columns: list[str]=None,
+    input_format: Literal["positional", "keyword"]="positional", device=None
+):
+    results = None
+    for inputs in tqdm(dataset):
+        if isinstance(inputs, dict):
+            inputs = BatchFeature(inputs)
+        if device is not None:
+            inputs = inputs.to(device)
+        with torch.inference_mode():
+            if input_format == "keyword":
+                outputs = func(**inputs)
+            else:
+                if input_columns is not None:
+                    inputs = itemgetter(*input_columns)(inputs)
+                outputs = func(inputs)
+        outputs = post_proc_fn(outputs)
+        results = comb_fn(results, outputs)
+    return results
 
 class Embedder:
     def __init__(self, 
@@ -94,8 +133,8 @@ def get_sam_mask_generator(
         raise ValueError("device must be specified")
     # see available args at https://github.com/huggingface/transformers/blob/main/src/transformers/pipelines/mask_generation.py#L94
     # see args value at https://github.com/facebookresearch/segment-anything/blob/dca509fe793f601edb92606367a655c15ac00fdf/segment_anything/automatic_mask_generator.py#L36
-    generator = pipeline("mask-generation", 
-        model=model, 
+    generator = pipeline("mask-generation",
+        model=model,
         points_per_batch=points_per_batch,
         pred_iou_thresh=0.88,
         stability_score_thresh=0.95,
@@ -104,7 +143,7 @@ def get_sam_mask_generator(
         crops_nms_thresh=0.7,
         crop_overlap_ratio=512 / 1500,
         crop_n_points_downscale_factor=1,
-        device=device, 
+        device=device,
         **pipeline_kwargs
     )
     def gen_fn(images: list[Image.Image], **kwargs):

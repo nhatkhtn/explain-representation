@@ -3,6 +3,7 @@ from typing import Literal
 from PIL import Image
 import numpy as np
 import torch
+from torchvision.transforms.functional import to_pil_image
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
 
@@ -15,10 +16,11 @@ class LocalFeatureManager:
     3. categorical space: the space of matrices, where each row has length num_used_features, and each value is one of choices
     4. one-hot space: the space of one-hot encoded categorical matrices
     """
-    def __init__(self, input_image: Image.Image, input_segments: np.ndarray):
+    def __init__(self, input_image: Image.Image, input_segments: np.ndarray, return_format: Literal["pt", "PIL"]):
         self.input_image = input_image
         self.input_segments = input_segments
         self.im_shape = np.array(input_image).shape
+        self.return_format = return_format
         self.ordinal_encoder = LabelEncoder()
         self.onehot_encoder = OneHotEncoder(sparse_output=False, drop='first')
         self.choices_per_feature = None
@@ -26,10 +28,14 @@ class LocalFeatureManager:
         self.replacements = None
 
     def fit(self, 
-        choices_per_feature: dict[int, list[int]], 
+        choices_per_feature: dict[int, list[int]],
         replacements: torch.Tensor, 
         binary_masks: torch.Tensor,
     ):
+        """Fit the manager with the choices per feature, the replacements, and the binary masks.
+
+        WARNING: the replacements have channel-last format.
+        """
         assert binary_masks.shape[0] == len(replacements), "Number of masks and crops must match"
 
         self.ordinal_encoder.fit(list(choices_per_feature.keys()))
@@ -44,6 +50,8 @@ class LocalFeatureManager:
         self.onehot_encoder.fit(categorical_traits)
         onehot_traits = self.onehot_encoder.transform(categorical_traits)
         images = self.mix(categorical_traits)
+        if self.return_format == "PIL":
+            images = [to_pil_image(im) for im in images]
         return torch.tensor(onehot_traits, dtype=torch.float32), images
 
     def sample_features(self, num_samples: int):
@@ -58,9 +66,11 @@ class LocalFeatureManager:
 
         return torch.tensor(features, dtype=torch.int64)
         
-    def mix(self, features: torch.Tensor) -> np.ndarray:
+    def mix(self, features: torch.Tensor):
         """Given features (a list of vectors in categorical space), return the mixed images (i.e, the images created by 
         overlaying the replacements according to the binary masks).
+
+        The returned tensor has shape (num_samples, 3, H, W).
         """
         num_replacements = self.binary_masks.shape[0]
         num_samples = features.shape[0]
@@ -70,8 +80,8 @@ class LocalFeatureManager:
         images = torch.take_along_dim(
             self.replacements.reshape(1, num_replacements, *self.im_shape), 
             blended_masks.reshape(num_samples, 1, *self.im_shape[:2], 1), dim=1,
-        ).squeeze(dim=1)
-        return images.numpy()
+        ).squeeze(dim=1).permute(0, 3, 1, 2)
+        return images
 
     def decode(self, x: np.ndarray, out_level: Literal["image", "feature", "ordinal", "categorical"], with_choices=False):
         """Given a matrix x, return the decoded tensor at the specified level."""

@@ -20,8 +20,8 @@ class LocalRepresentationApproximator(torch.nn.Module):
         Returns:
             A tensor of shape (query_size, key_size) representing the similarity logits.
         """
-        query_repr = self.query_encoder(queries)
-        key_repr = self.key_encoder(keys)
+        query_repr = self.query_encoder(queries, normalize=True)
+        key_repr = self.key_encoder(keys, normalize=True)
         logits = torch.nn.functional.softmax(query_repr @ key_repr.T / self.temperature, dim=1)
         return logits
     
@@ -41,7 +41,7 @@ class LocalRepresentationApproximator(torch.nn.Module):
         else:
             raise ValueError("At least one of query or key must be provided.")
         
-    def get_regularization_term(self, groups: Sequence[Sequence[int]]):
+    def get_regularization_term(self, groups: Optional[Sequence[Sequence[int]]]):
         """Returns the group lasso regularization term.
         Args:
             groups: A list of groups, where each group is a list of indices.
@@ -50,6 +50,8 @@ class LocalRepresentationApproximator(torch.nn.Module):
             A scalar representing the group lasso regularization term.
         """
         # weights have shape (output_dim, input_dim), as in https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
+        if groups is None:
+            return torch.Tensor([0])
         return torch.sum(torch.stack(
             [torch.norm(self.query_encoder.weight[:, indices], p=2) 
             for indices in groups]
