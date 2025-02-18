@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from tqdm.notebook import tqdm
 import datasets
+from sklearn.svm import SVC
 
 from exrep.loss import KDLoss
 from exrep.model import LocalRepresentationApproximator
@@ -23,6 +24,7 @@ def train_local_representation(
     keys: torch.Tensor,
     groups: Optional[Sequence[Sequence[int]]],
     alpha: float,
+    wandb_run=None,
     num_epochs: int = 10,
     batch_size: int = 256,
     log_every_n_steps: int = 10,
@@ -49,6 +51,7 @@ def train_local_representation(
     sample_input = train_dataset[0]
     model_config["local_dim"] = sample_input["inputs"].shape[0]
     model_config["repr_dim"] = sample_input["targets"].shape[0]
+    model_config["temperature"] = loss_config["temp_student"]
     train_loss_config = loss_config.copy()
     validation_loss_config = loss_config.copy()
     train_loss_config["data_size"] = len(train_dataset)
@@ -58,43 +61,34 @@ def train_local_representation(
     model = LocalRepresentationApproximator(device=device, **model_config)
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
     train_loss_fn = KDLoss(**train_loss_config)
+    logger.info("Done setting up model, optimizer, and loss")
 
     # prepare data
     keys = keys.to(device)
     train_dataset = train_dataset.add_column("indices", np.arange(len(train_dataset)))
     val_dataset = val_dataset.add_column("indices", np.arange(len(val_dataset)))
 
-    def compute_validation_loss():
-        model.eval()
-        val_loss_fn = KDLoss(**validation_loss_config)
-        losses = []
-        with torch.inference_mode():
-            keys_student = model.encode(key=keys)
-            for batch in val_dataset.iter(batch_size=batch_size):
-                features, targets, indices = itemgetter("inputs", "targets", "indices")(batch)
-                features = features.to(device)
-                targets = targets.to(device)
-                queries_student = model.encode(query=features)
-                loss_dict = val_loss_fn(queries_student, keys_student, targets, keys, indices)
-                losses.append(loss_dict)
-        agg_loss = {k: torch.stack([d[k] for d in losses]).mean() for k in losses[0].keys()}
-        return {"val_" + k: v for k, v in agg_loss.items()}
-
     # main training loop
     logs = {"train": [], "val": []}
     steps = 0
+    logger.info("Starting training")
     for epoch in range(num_epochs):
         model.train()
+        train_features, train_targets, train_labels = [], [], []
         for batch in train_dataset.iter(batch_size=batch_size):
-            features, targets, indices = itemgetter("inputs", "targets", "indices")(batch)
+            features, targets, labels, indices = itemgetter("inputs", "targets", "label", "indices")(batch)
             features = features.to(device)
             targets = targets.to(device)
+            labels = labels.to(device)
 
             queries_student = model.encode(query=features)
             keys_student = model.encode(key=keys)
 
+            train_features.append(model.encode(query=features, normalize=True))
+            train_targets.append(targets)
+            train_labels.append(labels)
+
             loss_dict = train_loss_fn(queries_student, keys_student, targets, keys, indices)
-            
             loss_regularize = alpha * model.get_regularization_term(groups)
             total_loss = loss_dict["grad_estimator"] + loss_regularize.to(device)
 
@@ -106,7 +100,49 @@ def train_local_representation(
             if log_every_n_steps > 0 and steps % log_every_n_steps == 0:
                 logger.info("Epoch %2d, Step %4d, Loss: %.5f", epoch, steps, total_loss.item())
             logs["train"].append({"epoch": epoch, "step": steps, "loss_reg": loss_regularize.item()} | pythonize(loss_dict))
-        logs["val"].append({"epoch": epoch, "step": steps} | pythonize(compute_validation_loss()))
+            wandb_run.log(logs["train"][-1], step=steps)
+
+        # validation
+        model.eval()
+        val_loss_fn = KDLoss(**validation_loss_config)
+        val_losses = []
+        
+        val_features, val_targets, val_labels = [], [], []
+        with torch.inference_mode():
+            keys_student = model.encode(key=keys)
+            for batch in val_dataset.iter(batch_size=batch_size):
+                features, targets, labels, indices = itemgetter("inputs", "targets", "label", "indices")(batch)
+                features = features.to(device)
+                targets = targets.to(device)
+                labels = labels.to(device)
+                queries_student = model.encode(query=features)
+                val_features.append(model.encode(query=features, normalize=True))
+                val_targets.append(targets)
+                val_labels.append(labels)
+                loss_dict = val_loss_fn(queries_student, keys_student, targets, keys, indices)
+                val_losses.append(loss_dict)
+
+        val_loss_dict = {
+            f"val_{k}": torch.stack([d[k] for d in val_losses]).mean().item() 
+            for k in val_losses[0].keys()
+        }
+        logs["val"].append({"epoch": epoch, "step": steps} | val_loss_dict)
+
+        # downstream evaluation
+        train_features = torch.cat(train_features, dim=0).detach().cpu().numpy()
+        train_targets = torch.cat(train_targets, dim=0).detach().cpu().numpy()
+        train_labels = torch.cat(train_labels, dim=0).detach().cpu().numpy()
+        val_features = torch.cat(val_features, dim=0).detach().cpu().numpy()
+        val_targets = torch.cat(val_targets, dim=0).detach().cpu().numpy()
+        val_labels = torch.cat(val_labels, dim=0).detach().cpu().numpy()
+        classifier = SVC(kernel="linear").fit(train_features, train_labels)
+        train_acc = classifier.score(train_features, train_labels)
+        val_acc = classifier.score(val_features, val_labels)
+        logs["val"][-1]["classify_train_acc"] = train_acc
+        logs["val"][-1]["classify_val_acc"] = val_acc
+        wandb_run.log(logs["val"][-1], step=steps)
+
+    logger.info("%s", torch.cuda.memory_summary(device=device))
 
     return model, logs
 

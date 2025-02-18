@@ -1,5 +1,7 @@
 import logging
 import os
+import shutil
+import pickle
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +14,8 @@ import torchvision.models as torchvision_models
 import torchvision.transforms.v2 as v2
 
 local_config = dotenv_values(find_dotenv(".env"))
+project_name = local_config["WANDB_PROJECT"]
+tmp_dir = Path("tmp/")
 
 logger = logging.getLogger(__name__)
 
@@ -62,52 +66,159 @@ def load_data(artifact_name: Optional[str]=None, base_name: Optional[str]=None, 
         dataset = datasets.load_from_disk(dataset_dir)
         return dataset
     
-def save_data(dataset: datasets.Dataset, base_name: str, phase: str, alias="latest", artifact_name=None, wandb_run=None):
-    base_name = alias_lookup(base_name)
-    artifact_name = f"{base_name}_{phase}"
+def get_artifact(
+    artifact_name: Optional[str]=None,
+    base_name: Optional[str]=None,
+    phase: Optional[str]=None,
+    identifier: Optional[str]=None,
+    type: Optional[str]=None,
+    metadata: Optional[dict]=None,
+    force_create=False,
+    alias="latest",
+    wandb_run=None,
+):
+    assert wandb_run is not None, "wandb_run must be provided"
 
-    local_dir = Path(local_config["DATA_DIR"]) / artifact_name
-    dataset.save_to_disk(local_dir)
+    if artifact_name is None:
+        assert base_name is not None and phase is not None, "Either artifact_name or base_name and phase must be provided"
+        base_name = alias_lookup(base_name)
+        if identifier is None:
+            artifact_name = f"{base_name}_{phase}"
+        else:
+            artifact_name = f"{base_name}_{phase}_{identifier}"
 
+    api = wandb.Api()
+    if not force_create and api.artifact_exists(f"{project_name}/{artifact_name}:{alias}"):
+        if type is not None or metadata is not None:
+            logger.warning("Artifact %s:%s already exists, but type and metadata are provided", artifact_name, alias)
+        artifact = wandb_run.use_artifact(f"{project_name}/{artifact_name}:{alias}")
+        return artifact
+    
+    if metadata is None:
+        metadata = {}
+
+    logger.info("Creating artifact %s:%s on wandb", artifact_name, alias)
+    if type is None:
+        raise ValueError("type must be provided when creating a new artifact")
     artifact = wandb.Artifact(
         artifact_name,
-        type="huggingface_dataset",
+        type=type,
         metadata={
             "base_name": base_name,
             "phase": phase,
-        },
+        } | metadata,
     )
-    artifact.add_dir(local_dir)
-    wandb_run.log_artifact(artifact, aliases=[alias])
+    return artifact
 
-def save_tensor(tensor: torch.Tensor, base_name: str, phase: str, model_name: str, alias="latest", wandb_run=None):
-    base_name = alias_lookup(base_name)
-    model_name = model_name.replace("/", "-")
-    artifact_name = f"{base_name}_{phase}_{model_name}"
-    local_path = (Path(local_config["DATA_DIR"]) / artifact_name).with_suffix(".pt")
+def save_file(
+    file_path: str | Path,
+    file_name: str,
+    alias="latest",
+    overwrite=False,
+    wandb_run=None,
+    artifact=None,
+    finalize=True,
+    **kwargs,
+):
+    if artifact is None:
+        artifact = get_artifact(
+            alias=alias,
+            wandb_run=wandb_run,
+            **kwargs,
+        )
+    if isinstance(file_path, Path):
+        file_path = file_path.as_posix()
+    artifact.add_file(
+        local_path=file_path,
+        name=file_name,
+        overwrite=overwrite
+    )
+    if finalize:
+        return wandb_run.log_artifact(artifact, aliases=[alias])
+    return artifact
 
-    logger.info("Saving tensor to local data dir and wandb %s:%s", local_path, alias)
+def save_dir(
+    local_path: str | Path,
+    alias="latest",
+    wandb_run=None,
+    artifact=None,
+    finalize=True,
+    **kwargs
+):
+    if artifact is None:
+        artifact = get_artifact(alias=alias, wandb_run=wandb_run, **kwargs)
+    if isinstance(local_path, Path):
+        local_path = local_path.as_posix()
+    artifact.add_dir(local_path)
+    if finalize:
+        return wandb_run.log_artifact(artifact, aliases=[alias])
+    return artifact
+
+def load_entry(
+    file_name: str,
+    **kwargs,
+):
+    artifact = get_artifact(**kwargs)
+    entry_path = artifact.get_entry(file_name).download()
+    return entry_path
+
+# below are convenience functions for saving and loading tensors
+# based on the above functions
+
+def save_tensor(
+    tensor: torch.Tensor,
+    file_name: str,
+    **kwargs,
+):
+    local_path = tmp_dir / file_name
     torch.save(tensor, local_path)
-
-    artifact = wandb.Artifact(
-        artifact_name,
-        type="torch_tensor",
-        metadata={
-            "base_name": base_name,
-            "phase": phase,
-            "model_name": model_name,
-        },
+    return save_file(
+        file_path=local_path,
+        file_name=file_name,
+        **kwargs,
     )
-    artifact.add_file(local_path.as_posix())
-    wandb_run.log_artifact(artifact, aliases=[alias])
 
-def load_tensor(artifact_name: str, alias="latest", wandb_run=None):
-    logger.info("Loading tensor from artifact %s:%s on wandb", artifact_name, alias)
-    artifact = wandb_run.use_artifact(f"{artifact_name}:{alias}")
-    file_name = f"{artifact_name}.pt"
-    file_path = artifact.get_entry(file_name).download()
-    tensor = torch.load(file_path)
+def load_tensor(
+    file_name: str,
+    map_location=None,
+    **kwargs,
+):
+    if map_location is None:
+        raise ValueError("Must specify map_location when loading tensors")
+    file_path = load_entry(
+        file_name=file_name,
+        **kwargs,
+    )
+    tensor = torch.load(file_path, map_location=map_location)
     return tensor
+
+def save_pickle(
+    obj,
+    file_name: str,
+    **kwargs,
+):
+    local_path = tmp_dir / file_name
+    with open(local_path, "wb") as f:
+        pickle.dump(obj, f)
+    return save_file(
+        file_path=local_path,
+        file_name=file_name,
+        **kwargs,
+    )
+
+def save_data(
+    dataset: datasets.Dataset,
+    dir_name: str,
+    **kwargs
+):
+    local_dir = tmp_dir / dir_name
+    if local_dir.exists():
+        raise FileExistsError(f"Directory {local_dir} already exists")
+    dataset.save_to_disk(local_dir)
+    artifact = save_dir(local_path=local_dir, **kwargs)
+    logger.info("Removing local temp directory %s", local_dir)
+    shutil.rmtree(local_dir)
+    return artifact
 
 def load_mocov3(arch, pretrained_path):
     # create model
