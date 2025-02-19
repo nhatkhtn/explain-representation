@@ -4,7 +4,7 @@ do
     for ((j = 1; j <= 5; j++));
     do
         # wandb agent nhathcmus/sweep-exrep-downstream1/vlt460yb --count 1
-        nohup wandb agent nhathcmus/sweep-exrep-downstream1/qyfpkblk --count 1 & 
+        nohup wandb agent nhathcmus/sweep-exrep-downstream1/2jtrm4yx --count 1 & 
         pid=$!
         echo "PID is "$pid""
     done

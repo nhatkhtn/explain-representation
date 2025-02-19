@@ -3,7 +3,7 @@ import os
 import shutil
 import pickle
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import dotenv_values, find_dotenv
 import torch
@@ -73,11 +73,12 @@ def get_artifact(
     identifier: Optional[str]=None,
     type: Optional[str]=None,
     metadata: Optional[dict]=None,
-    force_create=False,
+    mode: Optional[Literal["write-new", "incremental"]]="write-new",
     alias="latest",
     wandb_run=None,
 ):
     assert wandb_run is not None, "wandb_run must be provided"
+    assert mode in ["write-new", "incremental"], "mode must be one of 'write-new' or 'incremental'"
 
     if artifact_name is None:
         assert base_name is not None and phase is not None, "Either artifact_name or base_name and phase must be provided"
@@ -88,10 +89,13 @@ def get_artifact(
             artifact_name = f"{base_name}_{phase}_{identifier}"
 
     api = wandb.Api()
-    if not force_create and api.artifact_exists(f"{project_name}/{artifact_name}:{alias}"):
+    if api.artifact_exists(f"{project_name}/{artifact_name}:{alias}"):
         if type is not None or metadata is not None:
             logger.warning("Artifact %s:%s already exists, but type and metadata are provided", artifact_name, alias)
+
         artifact = wandb_run.use_artifact(f"{project_name}/{artifact_name}:{alias}")
+        if mode == "incremental":
+            artifact = artifact.new_draft()
         return artifact
     
     if metadata is None:
@@ -162,8 +166,8 @@ def load_entry(
     entry_path = artifact.get_entry(file_name).download()
     return entry_path
 
-# below are convenience functions for saving and loading tensors
-# based on the above functions
+# below are convenience functions
+# based on the above base functions
 
 def save_tensor(
     tensor: torch.Tensor,

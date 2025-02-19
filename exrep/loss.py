@@ -85,3 +85,48 @@ class KDLoss(torch.nn.Module):
         )
         return {"grad_estimator": loss_batch, "loss": loss_batch}       # TODO: check this
         # return {"grad_estimator": grad_estimator, "loss": loss_batch}
+
+class CELoss(torch.nn.Module):
+    """Optimizing this loss with a fixed teacher is equivalent to optimizing the KL divergence loss."""
+    def __init__(self,
+                 data_size: int,
+                 gamma1: float = 1.0,
+                 gamma2: float = 1.0,
+                 temp_student: float = 1.0,
+                 temp_teacher: float = 1.0,
+                 weights: torch.Tensor | None = None,
+                 ):
+        """Has the same signature as KDLoss for easy switching, but ignores the gamma parameters."""
+        super().__init__()
+        self.temp_student = temp_student
+        self.temp_teacher = temp_teacher
+        self.weights = weights
+
+    def forward(self,
+                queries_student: torch.Tensor,
+                keys_student: torch.Tensor,
+                queries_teacher: torch.Tensor,
+                keys_teacher: torch.Tensor,
+                index: torch.Tensor,
+                ):
+        # normalize the queries and keys
+        queries_student = torch.nn.functional.normalize(queries_student, dim=-1)
+        keys_student = torch.nn.functional.normalize(keys_student, dim=-1)
+
+        # logits are exp(cosine_similarity / temperature)
+        sim_teacher = queries_teacher @ keys_teacher.t() / self.temp_teacher
+        sim_student = queries_student @ keys_student.t() / self.temp_student
+
+        loss_batch = torch.nn.functional.cross_entropy(
+            input=sim_student,
+            target=torch.softmax(sim_teacher, dim=-1),
+        )
+        return {"grad_estimator": loss_batch, "loss": loss_batch}
+        
+def init_loss(name: str, **kwargs):
+    if name == "KDLoss":
+        return KDLoss(**kwargs)
+    elif name == "CELoss":
+        return CELoss(**kwargs)
+    else:
+        raise ValueError(f"Unknown loss name: {name}")

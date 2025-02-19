@@ -9,7 +9,7 @@ from tqdm.notebook import tqdm
 import datasets
 from sklearn.svm import SVC
 
-from exrep.loss import KDLoss
+from exrep.loss import init_loss
 from exrep.model import LocalRepresentationApproximator
 from exrep.utils import pythonize
 
@@ -60,7 +60,8 @@ def train_local_representation(
     # create the model, optimizer, and loss
     model = LocalRepresentationApproximator(device=device, **model_config)
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
-    train_loss_fn = KDLoss(**train_loss_config)
+    train_loss_fn = init_loss(**train_loss_config)
+    val_loss_fn = init_loss(**validation_loss_config)
     logger.info("Done setting up model, optimizer, and loss")
 
     # prepare data
@@ -104,7 +105,6 @@ def train_local_representation(
 
         # validation
         model.eval()
-        val_loss_fn = KDLoss(**validation_loss_config)
         val_losses = []
         
         val_features, val_targets, val_labels = [], [], []
