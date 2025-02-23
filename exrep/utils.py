@@ -155,3 +155,7 @@ def get_sam_mask_generator(
         ]
         return masks
     return gen_fn
+
+class Nop:
+    def nop(*args, **kw): pass
+    def __getattr__(self, _): return self.nop

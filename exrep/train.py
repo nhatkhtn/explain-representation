@@ -24,6 +24,7 @@ def train_local_representation(
     keys: torch.Tensor,
     groups: Optional[Sequence[Sequence[int]]],
     alpha: float,
+    eval_downstream=True,
     wandb_run=None,
     num_epochs: int = 10,
     batch_size: int = 256,
@@ -62,7 +63,6 @@ def train_local_representation(
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
     train_loss_fn = init_loss(**train_loss_config)
     val_loss_fn = init_loss(**validation_loss_config)
-    logger.info("Done setting up model, optimizer, and loss")
 
     # prepare data
     keys = keys.to(device)
@@ -72,7 +72,6 @@ def train_local_representation(
     # main training loop
     logs = {"train": [], "val": []}
     steps = 0
-    logger.info("Starting training")
     for epoch in range(num_epochs):
         model.train()
         train_features, train_targets, train_labels = [], [], []
@@ -129,20 +128,20 @@ def train_local_representation(
         logs["val"].append({"epoch": epoch, "step": steps} | val_loss_dict)
 
         # downstream evaluation
-        train_features = torch.cat(train_features, dim=0).detach().cpu().numpy()
-        train_targets = torch.cat(train_targets, dim=0).detach().cpu().numpy()
-        train_labels = torch.cat(train_labels, dim=0).detach().cpu().numpy()
-        val_features = torch.cat(val_features, dim=0).detach().cpu().numpy()
-        val_targets = torch.cat(val_targets, dim=0).detach().cpu().numpy()
-        val_labels = torch.cat(val_labels, dim=0).detach().cpu().numpy()
-        classifier = SVC(kernel="linear").fit(train_features, train_labels)
-        train_acc = classifier.score(train_features, train_labels)
-        val_acc = classifier.score(val_features, val_labels)
-        logs["val"][-1]["classify_train_acc"] = train_acc
-        logs["val"][-1]["classify_val_acc"] = val_acc
-        wandb_run.log(logs["val"][-1], step=steps)
+        if eval_downstream:
+            train_features = torch.cat(train_features, dim=0).detach().cpu().numpy()
+            train_targets = torch.cat(train_targets, dim=0).detach().cpu().numpy()
+            train_labels = torch.cat(train_labels, dim=0).detach().cpu().numpy()
+            val_features = torch.cat(val_features, dim=0).detach().cpu().numpy()
+            val_targets = torch.cat(val_targets, dim=0).detach().cpu().numpy()
+            val_labels = torch.cat(val_labels, dim=0).detach().cpu().numpy()
+            classifier = SVC(kernel="linear").fit(train_features, train_labels)
+            train_acc = classifier.score(train_features, train_labels)
+            val_acc = classifier.score(val_features, val_labels)
+            logs["val"][-1]["classify_train_acc"] = train_acc
+            logs["val"][-1]["classify_val_acc"] = val_acc
 
-    logger.info("%s", torch.cuda.memory_summary(device=device))
+        wandb_run.log(logs["val"][-1], step=steps)
 
     return model, logs
 
@@ -185,71 +184,3 @@ def regularization_path(
             "mean_val_loss": mean_val_loss, "std_val_loss": std_val_loss
         })
     return alpha_data, raw_data
-
-def concept_shap(
-    query_inputs_train: torch.Tensor,
-    query_inputs_val: torch.Tensor,
-    num_samples=1000,
-    **kwargs,
-):
-    """Compute the SHAP values indicating the contribution of each concept to the local representation.
-    
-    Args:
-        query_inputs_train (torch.Tensor): tensor of shape (n_queries, n_features) containing inputs in local feature space.
-        query_inputs_val (torch.Tensor): tensor of shape (n_queries, n_features) containing inputs in local feature space.
-        num_samples (int, optional): number of samples. Defaults to 1000.
-    """
-    num_features = query_inputs_train.shape[1]
-    train_fn = partial(train_local_representation,
-        groups=None, alpha=0,
-        log_every_n_steps=0, 
-        **kwargs
-    )
-
-    rng = np.random.default_rng(seed=42)
-    all_runs = []
-
-    shap_values = np.zeros(num_features)
-    
-    _, logs_base = train_fn(
-        query_inputs_train=torch.zeros_like(query_inputs_train),
-        query_inputs_val=torch.zeros_like(query_inputs_val),
-    )
-    val_loss_base = logs_base["val"][-1]["val_loss"]
-
-    for f in tqdm(range(num_features)):
-        concepts_masks = rng.choice(2, size=(num_samples, num_features))
-        concepts_masks[:, f] = 1
-        game_values = np.zeros(num_samples)
-
-        for i, concept_mask in tqdm(enumerate(concepts_masks)):
-            concept_indices = np.where(concept_mask == 1)[0]
-            
-            model_with, logs_with = train_fn(
-                query_inputs_train=query_inputs_train[:, concept_indices],
-                query_inputs_val=query_inputs_val[:, concept_indices],
-            )
-            # value = 0 when val_loss equals the base loss
-            # value = 1 when val_loss is 0
-            value_with = (val_loss_base - logs_with["val"][-1]["val_loss"]) / val_loss_base
-
-            concept_mask[f] = 0
-            model_without, logs_without = train_fn(
-                query_inputs_train=query_inputs_train[:, concept_indices],
-                query_inputs_val=query_inputs_val[:, concept_indices],
-            )
-            value_without = (val_loss_base - logs_without["val"][-1]["val_loss"]) / val_loss_base
-
-            game_values[i] = value_with - value_without
-            all_runs.append({
-                "concept_mask": concept_mask,
-                "concept_index": f,
-                "game_value": game_values[i],
-                "logs_with": logs_with,
-                "logs_without": logs_without,
-                "model_with": model_with,
-                "model_without": model_without,
-            })
-        shap_values[f] = game_values.mean()
-
-    return shap_values, all_runs

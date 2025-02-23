@@ -11,16 +11,9 @@ from exrep.train import train_local_representation
 
 logger = logging.getLogger(__name__)
 
-def train_surrogate_experiment(
-    run,
-    random_state=42,
-    device=None,
-):
-    assert device is not None, "Please provide a device to run the experiment on."
-
+def load_imagenet(run, device, random_state=42):
     embedding_artifact_name = "imagenet-1k-first-20-take-2000_target-embeddings_mocov3-resnet50"
     image_artifact_name = "imagenet-1k-first-20-take-2000_images"
-    output_phase_name = "surrogate"
 
     encoding = load_tensor(
         base_name="imagenet",
@@ -57,6 +50,23 @@ def train_surrogate_experiment(
     logger.info("Embeddings shape: %s", embeddings.shape)
     logger.info("Image dataset: %s", images_dataset)
     logger.info("XY dataset: %s", xy_dataset)
+    return {
+        "combined_dataset": xy_dataset,
+        "embeddings": embeddings,
+        "local-encoding": encoding,
+    }
+
+def train_surrogate_experiment(
+    run,
+    random_state=42,
+    device=None,
+):
+    assert device is not None, "Please provide a device to run the experiment on."
+
+    dataset_dict = load_imagenet(run, device, random_state)
+    xy_dataset = dataset_dict["combined_dataset"]
+    embeddings = dataset_dict["embeddings"]
+    output_phase_name = "surrogate"
 
     model, logs = train_local_representation(
         alpha=0,
