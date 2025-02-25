@@ -7,7 +7,7 @@ from dotenv import dotenv_values
 import wandb
 import torch
 
-from exrep.registry import get_artifact, load_model, save_tensor, load_processor
+from exrep.registry import load_model, save_tensor, load_processor, load_hf_dataset
 from exrep.utils import generic_map
 
 local_config = dotenv_values(".env")
@@ -25,28 +25,9 @@ run = wandb.init(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("dataset_name", type=str)
-    parser.add_argument("--device", type=str, required=True)
-    args = parser.parse_args()
-    base_dataset_name = args.dataset_name
-    device = args.device
-
-    logger.info("Embedding model: %s", run.config.target_model)
-    
-    dataset_path = get_artifact(
-        base_name=base_dataset_name,
-        phase="images",
-        wandb_run=run,
-    ).download()
-    image_dataset = datasets.load_from_disk(dataset_path)
-    
-    model = load_model(run.config.target_model, device)
-    processor = load_processor(run.config.processor)
-
+def compute_embeddings(model, processor, dataset, device):
     dataloader = torch.utils.data.DataLoader(
-        image_dataset.with_transform(
+        dataset.with_transform(
             lambda x: {'image': processor(x['image'])},
         ),
         batch_size=128,
@@ -62,6 +43,27 @@ def main():
         input_columns=['image'],
         device=device
     )
+    return embeddings
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset_name", type=str)
+    parser.add_argument("--device", type=str, required=True)
+    args = parser.parse_args()
+    base_dataset_name = args.dataset_name
+    device = args.device
+
+    logger.info("Embedding model: %s", run.config.target_model)
+    
+    dataset = load_hf_dataset(
+        base_name=base_dataset_name,
+        phase="images",
+        wandb_run=run,
+    )['validation']
+    
+    model = load_model(run.config.target_model, device)
+    processor = load_processor(run.config.processor)
+    embeddings = compute_embeddings(model, processor, dataset, device)
     
     logger.info("Embeddings shape: %s", embeddings.shape)
 
@@ -69,8 +71,9 @@ def main():
         base_name=base_dataset_name,
         phase="target-embeddings",
         type="embeddings",
-        file_name="embeddings.pt",
+        file_name="embeddings-validation.pt",
         identifier=run.config.target_model,
+        mode='incremental',
         wandb_run=run
     )
 

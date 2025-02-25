@@ -6,66 +6,93 @@ import datasets
 import torch
 from sklearn.model_selection import train_test_split
 
-from exrep.registry import load_tensor, get_artifact, save_tensor
+from exrep.registry import load_hf_dataset, load_tensor, get_artifact, save_tensor
 from exrep.train import train_local_representation
 
 logger = logging.getLogger(__name__)
 
-def load_imagenet(run, device, random_state=42):
-    embedding_artifact_name = "imagenet-1k-first-20-take-2000_target-embeddings_mocov3-resnet50"
-    image_artifact_name = "imagenet-1k-first-20-take-2000_images"
+def load_imagenet(run, device):
+    base_name = 'imagenet'
+    encoding_alias = 'latest'
 
-    encoding = load_tensor(
-        base_name="imagenet",
+    encoding_artifact = get_artifact(
+        base_name=base_name,
         phase="local-encoding",
         identifier="agglomerative",
-        file_name=f"local-encoding_{run.config.num_clusters}.pt",
-        map_location=device,
+        alias=encoding_alias,
         wandb_run=run,
     )
-    embeddings = load_tensor(
-        "embeddings.pt",
-        artifact_name=embedding_artifact_name,
+    train_encoding = load_tensor(
+        f"local-encoding-{run.config.num_clusters}_train.pt",
         map_location=device,
+        artifact=encoding_artifact,
+    )
+    val_encoding = load_tensor(
+        f"local-encoding-{run.config.num_clusters}_validation.pt",
+        map_location=device,
+        artifact=encoding_artifact,
+    )
+    
+    embedding_artifact = get_artifact(
+        base_name=base_name,
+        phase="target-embeddings",
+        identifier='mocov3-resnet50',
         wandb_run=run,
     )
-    images_path = get_artifact(
-        image_artifact_name,
+    train_embeddings = load_tensor(
+        "embeddings-train.pt",
+        map_location=device,
+        artifact=embedding_artifact,
+    )
+    val_embeddings = load_tensor(
+        "embeddings-validation.pt",
+        map_location=device,
+        artifact=embedding_artifact,
+    )
+
+    images_dataset = load_hf_dataset(
+        base_name=base_name,
+        phase='images',
         wandb_run=run,
-    ).download()
-    images_dataset = datasets.load_from_disk(images_path)
-    labels_dataset = images_dataset.remove_columns(["image"])
+    )
 
-    if isinstance(embeddings, list):
-        embeddings = torch.cat(embeddings, dim=0)
-    embeddings_dataset = datasets.Dataset.from_dict({"targets": embeddings})
-    encoding_dataset = datasets.Dataset.from_dict({"inputs": encoding})
+    train_dataset = datasets.concatenate_datasets([
+            datasets.Dataset.from_dict({"inputs": train_encoding}),
+            datasets.Dataset.from_dict({"targets": train_embeddings}),
+            images_dataset['train'].remove_columns(['image']),
+        ],
+        axis=1,
+    ).with_format("torch")
+    val_dataset = datasets.concatenate_datasets([
+            datasets.Dataset.from_dict({"inputs": val_encoding}),
+            datasets.Dataset.from_dict({"targets": val_embeddings}),
+            images_dataset['validation'].remove_columns(['image']),
+        ],
+        axis=1,
+    ).with_format("torch")
 
-    xy_dataset = datasets.concatenate_datasets(
-        [encoding_dataset, embeddings_dataset, labels_dataset],
-        axis=1
-    ).with_format("torch").train_test_split(0.1, shuffle=False, seed=random_state)
-
-    logger.info("Encoding shape: %s", encoding.shape)
-    logger.info("Embeddings shape: %s", embeddings.shape)
-    logger.info("Image dataset: %s", images_dataset)
-    logger.info("XY dataset: %s", xy_dataset)
+    combined_dataset = datasets.DatasetDict({
+        "train": train_dataset,
+        "validation": val_dataset,
+    })
+    logger.info("Combined dataset: %s", combined_dataset)
+    
     return {
-        "combined_dataset": xy_dataset,
-        "embeddings": embeddings,
-        "local-encoding": encoding,
+        "combined_dataset": combined_dataset,
+        "keys_train": train_embeddings,
+        "keys_val": val_embeddings,
     }
 
 def train_surrogate_experiment(
     run,
-    random_state=42,
     device=None,
 ):
     assert device is not None, "Please provide a device to run the experiment on."
 
-    dataset_dict = load_imagenet(run, device, random_state)
+    dataset_dict = load_imagenet(run, device)
     xy_dataset = dataset_dict["combined_dataset"]
-    embeddings = dataset_dict["embeddings"]
+    keys_train = dataset_dict["keys_train"]
+    keys_val = dataset_dict["keys_val"]
     output_phase_name = "surrogate"
 
     model, logs = train_local_representation(
@@ -74,8 +101,9 @@ def train_surrogate_experiment(
         loss_config=run.config.loss,
         optimizer_config=run.config.optimizer,
         train_dataset=xy_dataset["train"],
-        val_dataset=xy_dataset["test"],
-        keys=embeddings,
+        val_dataset=xy_dataset["validation"],
+        keys_train=keys_train,
+        keys_val=keys_val,
         groups=None,
         wandb_run=run,
         num_epochs=40,

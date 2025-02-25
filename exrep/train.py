@@ -21,7 +21,8 @@ def train_local_representation(
     optimizer_config: dict,
     train_dataset: datasets.Dataset,
     val_dataset: datasets.Dataset,
-    keys: torch.Tensor,
+    keys_train: torch.Tensor,
+    keys_val: torch.Tensor,
     groups: Optional[Sequence[Sequence[int]]],
     alpha: float,
     eval_downstream=True,
@@ -65,7 +66,8 @@ def train_local_representation(
     val_loss_fn = init_loss(**validation_loss_config)
 
     # prepare data
-    keys = keys.to(device)
+    keys_train = keys_train.to(device)
+    keys_val = keys_val.to(device)
     train_dataset = train_dataset.add_column("indices", np.arange(len(train_dataset)))
     val_dataset = val_dataset.add_column("indices", np.arange(len(val_dataset)))
 
@@ -82,13 +84,13 @@ def train_local_representation(
             labels = labels.to(device)
 
             queries_student = model.encode(query=features)
-            keys_student = model.encode(key=keys)
+            keys_student = model.encode(key=keys_train)
 
             train_features.append(model.encode(query=features, normalize=True))
             train_targets.append(targets)
             train_labels.append(labels)
 
-            loss_dict = train_loss_fn(queries_student, keys_student, targets, keys, indices)
+            loss_dict = train_loss_fn(queries_student, keys_student, targets, keys_train, indices)
             loss_regularize = alpha * model.get_regularization_term(groups)
             total_loss = loss_dict["grad_estimator"] + loss_regularize.to(device)
 
@@ -108,7 +110,7 @@ def train_local_representation(
         
         val_features, val_targets, val_labels = [], [], []
         with torch.inference_mode():
-            keys_student = model.encode(key=keys)
+            keys_student = model.encode(key=keys_val)
             for batch in val_dataset.iter(batch_size=batch_size):
                 features, targets, labels, indices = itemgetter("inputs", "targets", "label", "indices")(batch)
                 features = features.to(device)
@@ -118,7 +120,7 @@ def train_local_representation(
                 val_features.append(model.encode(query=features, normalize=True))
                 val_targets.append(targets)
                 val_labels.append(labels)
-                loss_dict = val_loss_fn(queries_student, keys_student, targets, keys, indices)
+                loss_dict = val_loss_fn(queries_student, keys_student, targets, keys_val, indices)
                 val_losses.append(loss_dict)
 
         val_loss_dict = {
