@@ -21,13 +21,14 @@ tmp_dir = Path("tmp/")
 logger = logging.getLogger(__name__)
 
 def load_model(model_id: str, device: str, batch_size=256, **kwargs):
-    if model_id == "mocov3-resnet50":
-        return load_mocov3("resnet50", "r-50-100ep.pth.tar").to(device)
-
     return pipeline("image-feature-extraction", model=model_id, framework="pt",
         device=device, batch_size=batch_size, return_tensors=True, 
         pool=True, **kwargs,
     )
+
+imagenet_norm_transform = v2.Normalize(
+    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+)
 
 def load_processor(processor_id: str, **kwargs):
     if processor_id == "imagenet":
@@ -37,7 +38,7 @@ def load_processor(processor_id: str, **kwargs):
             v2.Resize(224),
             v2.CenterCrop(224),
             v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            imagenet_norm_transform,
         ])
         return transform
     
@@ -265,42 +266,3 @@ def load_hf_dataset(
     dataset_dir = artifact.download()
     dataset = datasets.load_from_disk(dataset_dir)
     return dataset
-
-def load_mocov3(arch, pretrained_path):
-    # create model
-    print("=> creating model '{}'".format(arch))
-    if arch.startswith('vit'):
-        model = vits.__dict__[arch]()
-        linear_keyword = 'head'
-    else:
-        model = torchvision_models.__dict__[arch]()
-        linear_keyword = 'fc'
-
-    # freeze all layers but the last fc
-    for name, param in model.named_parameters():
-        if name not in ['%s.weight' % linear_keyword, '%s.bias' % linear_keyword]:
-            param.requires_grad = False
-    
-    # load from pre-trained, before DistributedDataParallel constructor
-    if os.path.isfile(pretrained_path):
-        print("=> loading checkpoint '{}'".format(pretrained_path))
-        checkpoint = torch.load(pretrained_path, map_location="cpu")
-
-        # rename moco pre-trained keys
-        state_dict = checkpoint['state_dict']
-        for k in list(state_dict.keys()):
-            # retain only base_encoder up to before the embedding layer
-            if k.startswith('module.base_encoder') and not k.startswith('module.base_encoder.%s' % linear_keyword):
-                # remove prefix
-                state_dict[k[len("module.base_encoder."):]] = state_dict[k]
-            # delete renamed or unused k
-            del state_dict[k]
-        msg = model.load_state_dict(state_dict, strict=False)
-        assert set(msg.missing_keys) == {"%s.weight" % linear_keyword, "%s.bias" % linear_keyword}
-
-        print("=> loaded pre-trained model '{}'".format(pretrained_path))
-    else:
-        print("=> no checkpoint found at '{}'".format(pretrained_path))
-
-    model.fc = torch.nn.Identity()
-    return model

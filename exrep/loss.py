@@ -1,6 +1,71 @@
 import torch
 
-class KDLoss(torch.nn.Module):
+class SimilarityLoss(torch.nn.Module):
+    """Base class for teacher-student similarity losses."""
+    def __init__(self, temp_student: float = 1.0, temp_teacher: float = 1.0):
+        super().__init__()
+        self.temp_student = temp_student
+        self.temp_teacher = temp_teacher
+                 
+    @staticmethod
+    def get_scaled_sim(queries: torch.Tensor, keys: torch.Tensor, temp: float):
+        """Compute cosine similarity with temperature scaling."""
+        queries = torch.nn.functional.normalize(queries, dim=-1)
+        keys = torch.nn.functional.normalize(keys, dim=-1)
+        return queries @ keys.t() / temp
+
+    def get_teacher_sim(self, queries: torch.Tensor, keys: torch.Tensor):
+        """Convinience function to compute similarity with teacher temperature."""
+        return self.get_scaled_sim(queries, keys, self.temp_teacher)
+
+    def get_student_sim(self, queries: torch.Tensor, keys: torch.Tensor):
+        """Convinience function to compute similarity with student temperature."""
+        return self.get_scaled_sim(queries, keys, self.temp_student)
+
+class KDLossNaive(SimilarityLoss):
+    """This loss use the same interface as KDLoss, but does not use the moving average mechanism."""
+    def __init__(self,
+                 data_size: int = None,
+                 gamma1: float = 1.0,
+                 gamma2: float = 1.0,
+                 temp_student: float = 1.0,
+                 temp_teacher: float = 1.0,
+                 weights: torch.Tensor | None = None,
+                 ):
+        """Knowledge distillation loss
+
+        Args:
+            data_size (int): size of the dataset, used to determine the length of u vector
+            gamma1 (float): moving average coefficient for u update
+            gamma2 (float): moving average coefficient for v update
+            temp_student (float, optional): temperature for student. Defaults to 1.0.
+            temp_teacher (float, optional): temperature for teacher. Defaults to 1.0.
+            weights (torch.Tensor, optional): weights for each sample. Defaults to None.
+        """
+        super().__init__(temp_student=temp_student, temp_teacher=temp_teacher)
+        self.weights = weights
+
+    def forward(self,
+                queries_student: torch.Tensor,
+                keys_student: torch.Tensor,
+                queries_teacher: torch.Tensor,
+                keys_teacher: torch.Tensor,
+                index: torch.Tensor,
+                ):
+        sim_student = self.get_student_sim(queries_student, keys_student)
+        sim_teacher = self.get_teacher_sim(queries_teacher, keys_teacher)
+        logprob_student = torch.log_softmax(sim_student, dim=-1)
+        logprob_teacher = torch.log_softmax(sim_teacher, dim=-1) 
+        loss_batch = torch.nn.functional.kl_div(
+            input=logprob_student,
+            target=logprob_teacher,
+            reduction="batchmean",
+            log_target=True,
+        )
+        accuracy = torch.mean((sim_student.argmax(dim=-1) == sim_teacher.argmax(dim=-1)).float())
+        return {"grad_estimator": loss_batch, "loss": loss_batch, "accuracy": accuracy}
+        
+class KDLoss(SimilarityLoss):
     def __init__(self,
                  data_size: int,
                  gamma1: float = 1.0,
@@ -28,7 +93,7 @@ class KDLoss(torch.nn.Module):
         self.weights = weights
 
         self.u = torch.zeros(data_size, device="cpu").reshape(-1, 1)
-        self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)
+        self.v = torch.zeros(data_size, device="cpu").reshape(-1, 1)    
 
     def forward(self,
                 queries_student: torch.Tensor,
@@ -37,14 +102,10 @@ class KDLoss(torch.nn.Module):
                 keys_teacher: torch.Tensor,
                 index: torch.Tensor,
                 ):
-        # normalize the queries and keys
-        queries_student = torch.nn.functional.normalize(queries_student, dim=-1)
-        keys_student = torch.nn.functional.normalize(keys_student, dim=-1)
-
         # update u
         # logits are exp(cosine_similarity / temperature)
-        sim_teacher = queries_teacher @ keys_teacher.t()
-        logits_teacher = torch.exp(sim_teacher / self.temp_teacher)                      # shape: (B^x, B^k)
+        sim_teacher = self.get_teacher_sim(queries_teacher, keys_teacher)
+        logits_teacher = torch.exp(sim_teacher)                                        # shape: (B^x, B^k)
         with torch.no_grad():
             u = self.u[index].to(queries_teacher.device)                               # shape: (B^x, 1)
             if u.sum() == 0:
@@ -55,8 +116,8 @@ class KDLoss(torch.nn.Module):
             self.u[index] = u.cpu()
 
         # update v
-        sim_student = queries_student @ keys_student.t()
-        logits_student = torch.exp(sim_student / self.temp_student)                      # shape: (B^x, B^k)
+        sim_student = self.get_student_sim(queries_student, keys_student)
+        logits_student = torch.exp(sim_student)                                        # shape: (B^x, B^k)
         with torch.no_grad():
             v = self.v[index].to(queries_student.device)                               # shape: (B^x, 1)
             if v.sum() == 0:
@@ -79,8 +140,8 @@ class KDLoss(torch.nn.Module):
             #                              torch.softmax(logits_teacher, dim=-1) * torch.log_softmax(logits_student, dim=-1), dim=-1)
             # loss_batch_mean = torch.mean(loss_per_element)
         loss_batch = torch.nn.functional.kl_div(
-            input=torch.log_softmax(sim_student / self.temp_student, dim=-1), 
-            target=torch.softmax(sim_teacher / self.temp_teacher, dim=-1), 
+            input=torch.log_softmax(sim_student / self.temp_student, dim=-1),
+            target=torch.softmax(sim_teacher / self.temp_teacher, dim=-1),
             reduction="batchmean",
         )
         return {"grad_estimator": loss_batch, "loss": loss_batch}       # TODO: check this
@@ -128,5 +189,7 @@ def init_loss(name: str, **kwargs):
         return KDLoss(**kwargs)
     elif name == "CELoss":
         return CELoss(**kwargs)
+    elif name == "KDLossNaive":
+        return KDLossNaive(**kwargs)
     else:
         raise ValueError(f"Unknown loss name: {name}")
