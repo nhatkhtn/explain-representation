@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import datasets
@@ -9,12 +10,12 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, StackDataset, TensorDataset
 
 from exrep.dataset import HFDatasetWrapper, StackDictDataset
-from exrep.registry import load_hf_dataset, load_processor, load_tensor, get_artifact, save_tensor, load_model, imagenet_norm_transform
+from exrep.registry import load_hf_dataset, load_processor, load_tensor, get_artifact, save_tensor, imagenet_norm_transform
 from exrep.train import train_local_representation
 
 logger = logging.getLogger(__name__)
 
-def load_data_from_runs(run, batch_size=1024, device=None):
+def load_data_from_runs(run, device=None):
     assert device is not None, "Device needs to be specified"
     base_name = 'imagenet'
     encoding_alias = 'latest'
@@ -75,12 +76,14 @@ def load_data_from_runs(run, batch_size=1024, device=None):
                 indices=torch.arange(len(train_encoding)),
             )
         ),
-        batch_size=batch_size,
+        # shuffle=True,
+        batch_size=run.config.training['key_batch_size'],
         num_workers=4,
         prefetch_factor=2,
         pin_memory=True,
         pin_memory_device=device,
     )
+    # note that we don't shuffle the validation set
     val_dataloader = DataLoader(
         StackDictDataset(
             HFDatasetWrapper(images_dataset['validation'].with_transform(val_transform)), 
@@ -103,15 +106,12 @@ def load_data_from_runs(run, batch_size=1024, device=None):
 
 def train_surrogate_experiment(
     run,
-    save=True,
+    save: Optional[str]=None,
     device=None,
 ):
     assert device is not None, "Please provide a device to run the experiment on."
 
-    train_dataloader, val_dataloader, data_sizes = load_data_from_runs(run,
-        batch_size=run.config.training['batch_size'], 
-        device=device
-    )
+    train_dataloader, val_dataloader, data_sizes = load_data_from_runs(run, device=device)
     output_phase_name = "surrogate"
 
     model, logs = train_local_representation(
@@ -119,6 +119,7 @@ def train_surrogate_experiment(
         loss_config=run.config.loss,
         optimizer_config=run.config.optimizer,
         target_config=run.config.target,
+        training_config=run.config.training,
         data_sizes=data_sizes,
         train_dataset=train_dataloader,
         val_dataset=val_dataloader,
@@ -135,8 +136,8 @@ def train_surrogate_experiment(
             base_name="imagenet",
             phase=output_phase_name,
             type="model",
-            identifier=run.config.target_model,
-            mode="write-new",
+            identifier=run.config.target['name'] + "-" + run.config.target['variant'],
+            mode=save,
             wandb_run=run,
         )
 
@@ -150,19 +151,17 @@ if __name__ == "__main__":
 
     random_state = 42
 
-    output_phase_name = "surrogate"
-
     run = wandb.init(
         project=local_config["WANDB_PROJECT"],
         config={
             "job_type": "train_representation",
-            "num_clusters": 40,
+            "num_clusters": 80,
         },
         # reinit=True,
         save_code=True,
     )
 
-    device = "cuda:7"
+    device = "cuda:5"
 
     train_configs = {
         "target": dict(
@@ -174,24 +173,24 @@ if __name__ == "__main__":
             use_key_encoder=False,
         ),
         "loss": dict(
-            name="KDLossNaive",
+            name="KDNaiveLoss+CELoss",
+            labda=0.5,
+            variant='ce',
             gamma1=1.0,
             gamma2=1.0,
-            temp_student=0.01,
-            temp_teacher=0.01,
+            temp_student=0.2,
+            temp_teacher=0.2,
         ),
         "optimizer": dict(
             lr=1e-3,
             weight_decay=1e-4,
         ),
         "training": dict(
-            query_batch_size=32,
-            key_batch_size=512,
+            query_batch_size=1024,
+            key_batch_size=1024,
             epochs=200,
         ),
     }
     run.config.update(train_configs)
 
-    from scripts.train_surrogate import train_surrogate_experiment
-
-    model, logs = train_surrogate_experiment(run, device=device, save=True)
+    model, logs = train_surrogate_experiment(run, device=device, save=False)

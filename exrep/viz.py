@@ -72,6 +72,6 @@ def viz_clusters(clusters, cluster_labels, crops_dataset, preview_size=8, shuffl
         fig, axs = plt.subplots(1, preview_size, figsize=(20, 2))
         fig.suptitle(cluster_id)
         for ax, i in zip(axs, indices):
-            display_im = crops_dataset[int(i)]["crops"].resize((80, 80))
+            display_im = crops_dataset[int(i)]["patches"].resize((80, 80))
             ax.imshow(display_im)
             ax.axis("off")

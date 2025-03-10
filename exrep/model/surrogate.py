@@ -1,5 +1,3 @@
-from typing import Optional, Sequence
-
 import torch
 
 class LocalRepresentationApproximator(torch.nn.Module):

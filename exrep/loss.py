@@ -1,3 +1,6 @@
+import logging
+from typing import Literal, Sequence
+
 import torch
 
 class SimilarityLoss(torch.nn.Module):
@@ -10,9 +13,9 @@ class SimilarityLoss(torch.nn.Module):
     @staticmethod
     def get_scaled_sim(queries: torch.Tensor, keys: torch.Tensor, temp: float):
         """Compute cosine similarity with temperature scaling."""
-        queries = torch.nn.functional.normalize(queries, dim=-1)
-        keys = torch.nn.functional.normalize(keys, dim=-1)
-        return queries @ keys.t() / temp
+        q = torch.nn.functional.normalize(queries, dim=-1)
+        k = torch.nn.functional.normalize(keys, dim=-1)
+        return q @ k.T / temp
 
     def get_teacher_sim(self, queries: torch.Tensor, keys: torch.Tensor):
         """Convinience function to compute similarity with teacher temperature."""
@@ -22,7 +25,7 @@ class SimilarityLoss(torch.nn.Module):
         """Convinience function to compute similarity with student temperature."""
         return self.get_scaled_sim(queries, keys, self.temp_student)
 
-class KDLossNaive(SimilarityLoss):
+class KDNaiveLoss(SimilarityLoss):
     """This loss use the same interface as KDLoss, but does not use the moving average mechanism."""
     def __init__(self,
                  data_size: int = None,
@@ -31,6 +34,7 @@ class KDLossNaive(SimilarityLoss):
                  temp_student: float = 1.0,
                  temp_teacher: float = 1.0,
                  weights: torch.Tensor | None = None,
+                 variant: Literal['kd', 'ce'] = 'kd',
                  ):
         """Knowledge distillation loss
 
@@ -43,7 +47,14 @@ class KDLossNaive(SimilarityLoss):
             weights (torch.Tensor, optional): weights for each sample. Defaults to None.
         """
         super().__init__(temp_student=temp_student, temp_teacher=temp_teacher)
+
+        logging.info("Initializing KDNaiveLoss with student temp %.2f and teacher temp %.2f", temp_student, temp_teacher)
+
         self.weights = weights
+        self.variant = variant
+
+        assert variant in ('kd', 'ce'), f"Unknown variant {variant}"
+        
 
     def forward(self,
                 queries_student: torch.Tensor,
@@ -54,16 +65,23 @@ class KDLossNaive(SimilarityLoss):
                 ):
         sim_student = self.get_student_sim(queries_student, keys_student)
         sim_teacher = self.get_teacher_sim(queries_teacher, keys_teacher)
-        logprob_student = torch.log_softmax(sim_student, dim=-1)
-        logprob_teacher = torch.log_softmax(sim_teacher, dim=-1) 
-        loss_batch = torch.nn.functional.kl_div(
-            input=logprob_student,
-            target=logprob_teacher,
-            reduction="batchmean",
-            log_target=True,
-        )
-        accuracy = torch.mean((sim_student.argmax(dim=-1) == sim_teacher.argmax(dim=-1)).float())
-        return {"grad_estimator": loss_batch, "loss": loss_batch, "accuracy": accuracy}
+        
+        if self.variant == 'kd':
+            logprob_student = torch.log_softmax(sim_student, dim=-1)
+            logprob_teacher = torch.log_softmax(sim_teacher, dim=-1)
+            
+            loss_batch = torch.nn.functional.kl_div(                
+                input=logprob_student,
+                target=logprob_teacher,
+                reduction="batchmean",
+                log_target=True,
+            )
+        else:
+            loss_batch = torch.nn.functional.cross_entropy(
+                input=sim_student,
+                target=torch.softmax(sim_teacher, dim=-1),
+            )
+        return {"loss": loss_batch}
         
 class KDLoss(SimilarityLoss):
     def __init__(self,
@@ -147,20 +165,17 @@ class KDLoss(SimilarityLoss):
         return {"grad_estimator": loss_batch, "loss": loss_batch}       # TODO: check this
         # return {"grad_estimator": grad_estimator, "loss": loss_batch}
 
-class CELoss(torch.nn.Module):
-    """Optimizing this loss with a fixed teacher is equivalent to optimizing the KL divergence loss."""
+class CELoss(SimilarityLoss):
+    """This is the 'hard' cross-entropy loss, where the targets are one-hot labels."""
     def __init__(self,
-                 data_size: int,
+                 data_size: int = None,
                  gamma1: float = 1.0,
                  gamma2: float = 1.0,
                  temp_student: float = 1.0,
                  temp_teacher: float = 1.0,
                  weights: torch.Tensor | None = None,
                  ):
-        """Has the same signature as KDLoss for easy switching, but ignores the gamma parameters."""
-        super().__init__()
-        self.temp_student = temp_student
-        self.temp_teacher = temp_teacher
+        super().__init__(temp_student=temp_student, temp_teacher=temp_teacher)
         self.weights = weights
 
     def forward(self,
@@ -170,26 +185,50 @@ class CELoss(torch.nn.Module):
                 keys_teacher: torch.Tensor,
                 index: torch.Tensor,
                 ):
-        # normalize the queries and keys
-        queries_student = torch.nn.functional.normalize(queries_student, dim=-1)
-        keys_student = torch.nn.functional.normalize(keys_student, dim=-1)
+        
+        sim_student = self.get_student_sim(queries_student, keys_student)
+        sim_teacher = self.get_teacher_sim(queries_teacher, keys_teacher)
 
-        # logits are exp(cosine_similarity / temperature)
-        sim_teacher = queries_teacher @ keys_teacher.t() / self.temp_teacher
-        sim_student = queries_student @ keys_student.t() / self.temp_student
+        # prediction = argmax over the key dimension
+        teacher_labels = torch.argmax(sim_teacher, dim=-1)
 
         loss_batch = torch.nn.functional.cross_entropy(
             input=sim_student,
-            target=torch.softmax(sim_teacher, dim=-1),
+            target=teacher_labels,
         )
-        return {"grad_estimator": loss_batch, "loss": loss_batch}
-        
+
+        accuracy = torch.mean((sim_student.argmax(dim=-1) == teacher_labels).float())
+        return {"loss": loss_batch, "accuracy": accuracy}
+
+class CombinedLoss(torch.nn.Module):
+    """Weighted sum of KL and CE losses"""
+    def __init__(self, labda: float, **kwargs):
+        super().__init__()
+        self.labda = labda
+        self.kl_loss = KDNaiveLoss(**kwargs)
+        kwargs.pop('variant')
+        self.ce_loss = CELoss(**kwargs)
+
+    def forward(self, *args, **kwargs):
+        kl_loss_dict = self.kl_loss(*args, **kwargs)
+        ce_loss_dict = self.ce_loss(*args, **kwargs)
+        kl_loss_val = kl_loss_dict.pop("loss")
+        ce_loss_val = ce_loss_dict.pop("loss")
+        return kl_loss_dict | ce_loss_dict | {
+            "loss": self.labda * kl_loss_val + (1 - self.labda) * ce_loss_val,
+            "kl_loss": kl_loss_val,
+            "ce_loss": ce_loss_val,
+        }
+
 def init_loss(name: str, **kwargs):
     if name == "KDLoss":
         return KDLoss(**kwargs)
     elif name == "CELoss":
         return CELoss(**kwargs)
-    elif name == "KDLossNaive":
-        return KDLossNaive(**kwargs)
+    elif name == "KDNaiveLoss":
+        return KDNaiveLoss(**kwargs)
+    elif name == 'KDNaiveLoss+CELoss':
+        labda = kwargs.pop('labda')
+        return CombinedLoss(labda, **kwargs)
     else:
         raise ValueError(f"Unknown loss name: {name}")

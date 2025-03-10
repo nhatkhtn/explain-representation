@@ -16,6 +16,7 @@ def train_local_representation(
     loss_config: dict,
     optimizer_config: dict,
     target_config: dict,
+    training_config: dict,
     data_sizes: dict,
     train_dataset: torch.utils.data.DataLoader,
     val_dataset: torch.utils.data.DataLoader,
@@ -56,6 +57,8 @@ def train_local_representation(
 
     # create the model, optimizer, and loss
     model = LocalRepresentationApproximator(device=device, **model_config)
+    # note the LR is scaled according to the batch size
+    optimizer_config['lr'] *= training_config['query_batch_size'] / 256
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
     train_loss_fn = init_loss(**train_loss_config)
     val_loss_fn = init_loss(**validation_loss_config)
@@ -65,33 +68,47 @@ def train_local_representation(
     steps = 0
     for epoch in range(num_epochs):
         model.train()
-        for batch in train_dataset:
+        for keys_batch in train_dataset:
             # obtain inputs
-            features, images, labels, indices = itemgetter("inputs", "image", "label", "indices")(batch)
-            features = features.to(device)
-            images = images.to(device)
+            keys_images = itemgetter("image")(keys_batch)
+            keys_images = keys_images.to(device)
 
             # compute queries and keys
             with torch.no_grad():
-                queries_teacher, keys_teacher, key_embeddings = target_model.self_sim(images)
-            # queries_student, keys_student = model(features, key_embeddings)
-            queries_student, keys_student = model(features, keys_teacher)
+                keys_embedding = target_model.embed(keys_images)
+                keys_teacher = target_model.encode_key(keys_embedding)
 
-            # compute losses
-            loss_dict = train_loss_fn(queries_student, keys_student, queries_teacher, keys_teacher, indices)
-            total_loss = loss_dict["grad_estimator"]
+            dataset = torch.utils.data.StackDataset(**keys_batch)
+            dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=training_config['query_batch_size'],
+                num_workers=1, prefetch_factor=2, pin_memory=True, pin_memory_device=device,
+            )
+            
+            for queries_batch in dataloader:
+                features, query_images, indices = itemgetter("inputs", "image", "indices")(queries_batch)
+                features = features.to(device)
+                query_images = query_images.to(device)
 
-            # update model
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+                # queries_student, keys_student = model(features, key_embeddings)
+                queries_student, keys_student = model(features, keys_teacher)
+                queries_embeddings = target_model.embed(query_images)
+                queries_teacher = target_model.encode_query(queries_embeddings)
 
-            # logging
-            steps += 1
-            if log_every_n_steps > 0 and steps % log_every_n_steps == 0:
-                logger.info("Epoch %2d, Step %4d, Loss: %.5f, Acc: %.2f", epoch, steps, total_loss.item(), loss_dict["accuracy"])
-            logs["train"].append({"epoch": epoch, "step": steps} | pythonize(loss_dict))
-            wandb_run.log(logs["train"][-1], step=steps)
+                # compute losses
+                loss_dict = train_loss_fn(queries_student, keys_student, queries_teacher, keys_teacher, indices)
+                total_loss = loss_dict["loss"]
+
+                # update model
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                # logging
+                steps += 1
+                if log_every_n_steps > 0 and steps % log_every_n_steps == 0:
+                    logger.info("Epoch %2d, Step %4d, Loss: %.5f, Acc: %.2f", epoch, steps, total_loss.item(), loss_dict["accuracy"])
+                logs["train"].append({"epoch": epoch, "step": steps} | pythonize(loss_dict))
+                wandb_run.log(logs["train"][-1], step=steps)
 
         # validation loop
         model.eval()

@@ -197,6 +197,7 @@ def save_tensor(
     **kwargs,
 ):
     local_path = tmp_dir / file_name
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     torch.save(tensor, local_path)
     return save_file(
         file_path=local_path,
